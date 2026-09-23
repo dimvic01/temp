@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+
+  workflow_dispatch:
+    inputs:
+      deploy_local:
+        description: Deploy selected image locally
+        required: true
+        type: boolean
+        default: false
+
+      image_tag:
+        description: Image tag to deploy (for example main or release-1.2.0)
+        required: true
+        type: string
+
+
+# ============================================================
+# Feature branch / Main / Release
+# Build, test and publish image to GHCR
+# ============================================================
+
+jobs:
+
+  build:
+    if: github.event_name == 'push'
+
+    uses: ./.github/workflows/build-and-publish.yml
+
+    permissions:
+      contents: read
+      packages: write
+
+    secrets: inherit
+
+
+  # ============================================================
+  # Feature branch
+  # Automatically deploy locally
+  # ============================================================
+
+  deploy:
+    if: >
+      github.event_name == 'push' &&
+      github.ref_name != 'main' &&
+      !startsWith(github.ref_name, 'release/')
+
+    needs: build
+
+    uses: ./.github/workflows/deploy-local.yml
+
+    with:
+      image_tag: ${{ github.ref_name }}
+
+    permissions:
+      contents: read
+      packages: read
+
+    secrets: inherit
+
+
+  # ============================================================
+  # Manual deployment
+  # Deploy an existing GHCR image locally
+  # ============================================================
+
+  deploy-manual:
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      inputs.deploy_local == true
+
+    uses: ./.github/workflows/deploy-local.yml
+
+    with:
+      image_tag: ${{ inputs.image_tag }}
+
+    permissions:
+      contents: read
+      packages: read
+
+    secrets: inherit
+

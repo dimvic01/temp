@@ -1,0 +1,66 @@
+name: Deploy Local
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: 'Image tag'
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine image tag
+        id: image
+        shell: bash
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          TAG="${TAG//\//-}"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          echo "======================================"
+          echo "Input tag:     ${TAG}"
+          echo "Image:         ${REGISTRY}/${IMAGE_NAME}:${TAG}"
+          echo "======================================"
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ github.token }}" |
+            docker login "${REGISTRY}" \
+              -u "${{ github.actor }}" \
+              --password-stdin
+
+      - name: Pull image
+        run: |
+          IMAGE_REF="${REGISTRY}/${IMAGE_NAME}:${{ steps.image.outputs.tag }}"
+
+          echo "Pulling: ${IMAGE_REF}"
+
+          docker pull "${IMAGE_REF}"
+
+      - name: Deploy
+        run: |
+          export IMAGE_REF="${REGISTRY}/${IMAGE_NAME}:${{ steps.image.outputs.tag }}"
+
+          echo "Deploying: ${IMAGE_REF}"
+
+          docker compose pull task-api
+          docker compose up -d --remove-orphans
+
+      - name: Cleanup
+        run: docker image prune -f

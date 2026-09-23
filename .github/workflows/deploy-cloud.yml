@@ -1,0 +1,23 @@
+name: Deploy Cloud
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy'
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy
+        run: |
+          echo "Future cloud deployment"
+          echo "Image: ${REGISTRY}/${IMAGE_NAME}:${{ inputs.image_tag }}"

@@ -1,0 +1,22 @@
+name: Deploy Local Manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag, e.g. main or release-1.2.0'
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/deploy-local.yml
+
+    with:
+      image_tag: ${{ inputs.image_tag }}
+
+    permissions:
+      contents: read
+      packages: read
+
+    secrets: inherit

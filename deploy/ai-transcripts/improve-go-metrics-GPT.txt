@@ -1,0 +1,1104 @@
+Today 9:39 PM
+
+Please review go code, which is already tested and working. Improve prometheus metrics collection using HTTP methods.
+
+package main
+
+import (
+        "log"
+        "net/http"
+        "net/http/httptest"
+        "os"
+        "flag"
+        "fmt"
+        "time"
+        "strconv"
+        "strings"
+        "github.com/prometheus/client_golang/prometheus"
+        "github.com/prometheus/client_golang/prometheus/promauto"
+        "github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// Histogram definition
+var httpDuration = promauto.NewHistogramVec(
+    prometheus.HistogramOpts{
+        Name:    "http_request_duration_seconds",
+        Help:    "HTTP requests in seconds",
+        Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
+    },
+    []string{"path"},
+)
+
+var httpRequestsTotal = promauto.NewCounterVec(
+    prometheus.CounterOpts{
+        Name: "http_requests_total",
+        Help: "HTTP requests processed",
+    },
+    []string{"path", "status"},
+)
+
+type responseWriter struct {
+    http.ResponseWriter
+    statusCode int
+}
+
+func newResponseWriter(w http.ResponseWriter) *responseWriter {
+    return &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+    rw.statusCode = code
+    rw.ResponseWriter.WriteHeader(code)
+}
+
+// middleware wrapper
+func prometheusMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+
+        rw := newResponseWriter(w)
+        next.ServeHTTP(rw, r)
+
+        duration := time.Since(start).Seconds()
+        statusCodeStr := strconv.Itoa(rw.statusCode)
+
+        //Normalize the path label
+        path := normalizePath(r.URL.Path)
+
+        httpDuration.WithLabelValues(path).Observe(duration)
+        httpRequestsTotal.WithLabelValues(path, statusCodeStr).Inc()
+    })
+}
+
+func normalizePath(path string) string {
+    if path == "/tasks" || strings.HasPrefix(path, "/tasks/") {
+        return "/tasks"
+    }
+    return path
+}
+
+func main() {
+        port := getEnv("PORT", "8080")
+
+        // run internal health check and exit
+        isHealthcheck := flag.Bool("healthcheck", false, "Run internal health check query")
+        flag.Parse()
+
+        if *isHealthcheck {
+            url := fmt.Sprintf("http://localhost:%s/healthz", port)
+            resp, err := http.Get(url)
+            if err != nil || resp.StatusCode != http.StatusOK {
+                fmt.Println("Health check failed")
+                os.Exit(1)
+            }
+            fmt.Println("Health check OK")
+            os.Exit(0)
+        }
+
+        store := NewMemoryStore()
+
+        mux := http.NewServeMux()
+
+        // Health check — must respond 200 for liveness probes
+        mux.HandleFunc("GET /healthz", HealthHandler)
+
+        // Metrics — Prometheus-compatible plaintext endpoint
+        oldMetricsFunc := MetricsHandler(store)
+
+        mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+            oldMetricsFunc(w, r)
+            r.Header.Del("Accept-Encoding")
+
+            rec := httptest.NewRecorder()
+            promhttp.Handler().ServeHTTP(rec, r)
+
+            w.Write([]byte("\n"))
+            w.Write(rec.Body.Bytes())
+        })
+
+        // mux.HandleFunc("GET /metrics", MetricsHandler(store))
+        // mux.Handle("GET /metrics", promhttp.Handler())
+
+        // Task CRUD
+        mux.HandleFunc("GET /tasks", ListTasksHandler(store))
+        mux.HandleFunc("POST /tasks", CreateTaskHandler(store))
+        mux.HandleFunc("GET /tasks/{id}", GetTaskHandler(store))
+        mux.HandleFunc("PUT /tasks/{id}", UpdateTaskHandler(store))
+        mux.HandleFunc("DELETE /tasks/{id}", DeleteTaskHandler(store))
+
+        addr := ":" + port
+        log.Printf("task-api starting on %s", addr)
+        if err := http.ListenAndServe(addr, prometheusMiddleware(mux)); err != nil {
+                log.Fatalf("server error: %v", err)
+        }
+}
+
+func getEnv(key, fallback string) string {
+        if v := os.Getenv(key); v != "" {
+                return v
+        }
+        return fallback
+}
+
+Yes. Since the code already works, I’d focus on production robustness, observability, correctness under edge cases, and idiomatic Go, rather than changing the architecture unnecessarily.
+
+The biggest improvements I see are in the metrics middleware, /metrics handler, health-check implementation, and server lifecycle.
+1. Fix responseWriter handling
+
+Your wrapper currently handles the common case, but it misses some http.ResponseWriter interfaces and has a subtle WriteHeader issue.
+
+For example:
+
+func (rw *responseWriter) WriteHeader(code int) {
+    rw.statusCode = code
+    rw.ResponseWriter.WriteHeader(code)
+}
+
+WriteHeader should only take effect once. A handler can technically do:
+
+w.WriteHeader(500)
+w.WriteHeader(200)
+
+The actual HTTP status remains 500, but your recorded status becomes 200.
+
+At minimum:
+
+func (rw *responseWriter) WriteHeader(code int) {
+    if rw.statusCode != http.StatusOK {
+        return
+    }
+
+    rw.statusCode = code
+    rw.ResponseWriter.WriteHeader(code)
+}
+
+But I'd go one step further and implement Write() too:
+
+func (rw *responseWriter) WriteHeader(code int) {
+    if rw.wroteHeader {
+        return
+    }
+
+    rw.statusCode = code
+    rw.wroteHeader = true
+    rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *responseWriter) Write(b []byte) (int, error) {
+    if !rw.wroteHeader {
+        rw.WriteHeader(http.StatusOK)
+    }
+
+    return rw.ResponseWriter.Write(b)
+}
+
+with:
+
+type responseWriter struct {
+    http.ResponseWriter
+    statusCode  int
+    wroteHeader bool
+}
+
+That makes the semantics much closer to net/http.
+2. Your metrics path normalization is good, but I'd avoid raw arbitrary paths
+
+This:
+
+func normalizePath(path string) string {
+    if path == "/tasks" || strings.HasPrefix(path, "/tasks/") {
+        return "/tasks"
+    }
+    return path
+}
+
+is solving an important Prometheus problem: avoiding metrics such as:
+
+/tasks/1
+/tasks/2
+/tasks/3
+...
+
+which create unbounded label cardinality.
+
+However, currently every other arbitrary URL becomes a Prometheus label value.
+
+For example:
+
+/foo/123
+/foo/456
+/foo/789
+
+would produce three different time series.
+
+I'd strongly recommend recording route patterns, not URL paths.
+
+Since you're using Go's modern ServeMux patterns:
+
+mux.HandleFunc("GET /tasks/{id}", ...)
+
+you can potentially use the matched route rather than manually normalizing paths.
+
+In newer Go versions, r.Pattern gives you the matched pattern:
+
+path := r.Pattern
+if path == "" {
+    path = "unknown"
+}
+
+Then your metrics become:
+
+/tasks
+/tasks/{id}
+
+instead of:
+
+/tasks
+/tasks/123
+/tasks/456
+
+That's a substantial improvement.
+3. I'd rename the metrics
+
+Your names are valid, but I'd make them slightly more conventional.
+
+Instead of:
+
+http_request_duration_seconds
+http_requests_total
+
+I'd use something like:
+
+http_server_request_duration_seconds
+http_server_requests_total
+
+The prefix gives the metrics a namespace and makes them easier to identify in a larger Prometheus installation.
+
+For example:
+
+var httpRequestDuration = promauto.NewHistogramVec(
+    prometheus.HistogramOpts{
+        Name:    "http_server_request_duration_seconds",
+        Help:    "HTTP request duration in seconds.",
+        Buckets: prometheus.DefBuckets,
+    },
+    []string{"method", "route"},
+)
+
+and:
+
+var httpRequestsTotal = promauto.NewCounterVec(
+    prometheus.CounterOpts{
+        Name: "http_server_requests_total",
+        Help: "Total number of HTTP requests.",
+    },
+    []string{"method", "route", "status"},
+)
+
+I'd definitely add HTTP method.
+
+Right now these:
+
+GET /tasks
+POST /tasks
+
+are indistinguishable in your histogram because both become:
+
+path="/tasks"
+
+That's a significant observability limitation.
+4. Don't instrument /metrics itself unless you actually want that
+
+Currently:
+
+http.ListenAndServe(addr, prometheusMiddleware(mux))
+
+means /metrics gets recorded by your HTTP metrics.
+
+So every Prometheus scrape increments:
+
+http_requests_total{path="/metrics", ...}
+
+That's not necessarily wrong, but it often creates noise.
+
+I'd consider excluding it:
+
+if r.URL.Path != "/metrics" {
+    httpDuration.WithLabelValues(...).Observe(duration)
+    httpRequestsTotal.WithLabelValues(...).Inc()
+}
+
+Or, better, use a dedicated metrics handler outside the instrumented application mux.
+5. The /metrics implementation is unnecessarily complicated
+
+This part is the biggest code smell:
+
+oldMetricsFunc := MetricsHandler(store)
+
+mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+    oldMetricsFunc(w, r)
+    r.Header.Del("Accept-Encoding")
+
+    rec := httptest.NewRecorder()
+    promhttp.Handler().ServeHTTP(rec, r)
+
+    w.Write([]byte("\n"))
+    w.Write(rec.Body.Bytes())
+})
+
+You're essentially:
+
+    generating your application metrics,
+
+    generating Prometheus metrics into an in-memory recorder,
+
+    copying the result back to the real response.
+
+httptest.NewRecorder() should normally be used by tests, not request handling.
+
+I'd instead have MetricsHandler(store) expose your application metrics through Prometheus, or create a custom collector.
+
+If MetricsHandler(store) returns non-Prometheus metrics that must remain, then I'd investigate combining them properly rather than serializing two HTTP responses together.
+
+At minimum, I'd avoid:
+
+httptest.NewRecorder()
+
+in production request processing.
+6. The health check should use an HTTP client with a timeout
+
+Currently:
+
+resp, err := http.Get(url)
+
+http.Get uses the default client, which has no overall timeout.
+
+For a CLI health check, I'd use:
+
+client := &http.Client{
+    Timeout: 5 * time.Second,
+}
+
+resp, err := client.Get(url)
+if err != nil {
+    fmt.Println("Health check failed:", err)
+    os.Exit(1)
+}
+defer resp.Body.Close()
+
+if resp.StatusCode != http.StatusOK {
+    fmt.Printf("Health check failed: HTTP %d\n", resp.StatusCode)
+    os.Exit(1)
+}
+
+The defer resp.Body.Close() is also missing currently.
+7. Better yet, don't make the health check depend on a second HTTP request
+
+You have:
+
+application
+   ↓
+healthcheck CLI
+   ↓
+HTTP localhost
+   ↓
+application
+
+That's fine for a container health check because it verifies the actual HTTP listener.
+
+But I'd separate the internal health logic from the HTTP endpoint.
+
+For example:
+
+func healthCheck() bool {
+    return true
+}
+
+func HealthHandler(w http.ResponseWriter, r *http.Request) {
+    if !healthCheck() {
+        http.Error(w, "unhealthy", http.StatusServiceUnavailable)
+        return
+    }
+
+    w.WriteHeader(http.StatusOK)
+}
+
+Then the CLI check tests the HTTP endpoint, while the handler has reusable health logic.
+8. Use http.Server instead of http.ListenAndServe
+
+For a small application:
+
+http.ListenAndServe(...)
+
+is perfectly functional.
+
+For a production service, I'd prefer:
+
+server := &http.Server{
+    Addr:              addr,
+    Handler:           prometheusMiddleware(mux),
+    ReadHeaderTimeout: 5 * time.Second,
+    ReadTimeout:       15 * time.Second,
+    WriteTimeout:      30 * time.Second,
+    IdleTimeout:       60 * time.Second,
+}
+
+log.Printf("task-api starting on %s", addr)
+
+if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+    log.Fatalf("server error: %v", err)
+}
+
+This gives you protection against slow clients and makes graceful shutdown straightforward later.
+
+For an API exposed behind Kubernetes/Ingress, I'd definitely consider this worthwhile.
+9. Use log/slog if you're on a modern Go version
+
+Instead of:
+
+log.Printf("task-api starting on %s", addr)
+
+I'd consider:
+
+logger := slog.Default()
+
+logger.Info("server starting",
+    "addr", addr,
+)
+
+And errors:
+
+logger.Error("server stopped",
+    "error", err,
+)
+
+This becomes particularly useful when your service is running in Kubernetes and logs are consumed by Loki/ELK/etc.
+10. Handle graceful shutdown
+
+This is probably the biggest architectural improvement I'd make after metrics.
+
+Instead of having:
+
+if err := http.ListenAndServe(...); err != nil {
+    log.Fatalf(...)
+}
+
+you can handle:
+
+SIGTERM
+   ↓
+stop accepting connections
+   ↓
+finish active requests
+   ↓
+shutdown
+
+That's particularly important in Kubernetes.
+
+The basic pattern is:
+
+ctx, stop := signal.NotifyContext(
+    context.Background(),
+    os.Interrupt,
+    syscall.SIGTERM,
+)
+defer stop()
+
+server := &http.Server{
+    Addr:    addr,
+    Handler: handler,
+}
+
+go func() {
+    log.Printf("task-api starting on %s", addr)
+
+    if err := server.ListenAndServe(); err != nil &&
+        err != http.ErrServerClosed {
+        log.Fatalf("server error: %v", err)
+    }
+}()
+
+<-ctx.Done()
+
+shutdownCtx, cancel := context.WithTimeout(
+    context.Background(),
+    10*time.Second,
+)
+defer cancel()
+
+if err := server.Shutdown(shutdownCtx); err != nil {
+    log.Printf("graceful shutdown failed: %v", err)
+}
+
+11. getEnv() is fine, but could be simpler
+
+This:
+
+func getEnv(key, fallback string) string {
+    if v := os.Getenv(key); v != "" {
+        return v
+    }
+    return fallback
+}
+
+is perfectly reasonable.
+
+I wouldn't change it unless you want configuration validation.
+
+For example, if PORT is malformed:
+
+PORT=abc
+
+your application won't fail until:
+
+addr := ":" + port
+
+I'd potentially validate it:
+
+port := getEnv("PORT", "8080")
+
+if _, err := strconv.Atoi(port); err != nil {
+    log.Fatalf("invalid PORT %q", port)
+}
+
+12. Imports should be gofmt'd/grouped
+
+Your current imports:
+
+"log"
+"net/http"
+"net/http/httptest"
+"os"
+"flag"
+"fmt"
+"time"
+"strconv"
+"strings"
+
+should be formatted by gofmt, which will organize them alphabetically.
+
+Also, if you remove the httptest approach, that dependency disappears entirely.
+
+Run:
+
+gofmt -w .
+
+or preferably:
+
+gofmt -w *.go
+
+and use:
+
+go vet ./...
+
+I'd also run:
+
+go test ./...
+
+and, if the service has concurrency:
+
+go test -race ./...
+
+What I'd change first
+
+I wouldn't rewrite this application. I'd make these changes in roughly this order:
+Priority	Change	Why
+1	Fix responseWriter	Correct HTTP semantics
+2	Use r.Pattern for metrics	Prevent metric cardinality explosion
+3	Add method to metrics	GET/POST/etc. become distinguishable
+4	Remove httptest.NewRecorder() from /metrics	Cleaner production implementation
+5	Add HTTP client timeout to healthcheck	Avoid hanging healthcheck
+6	Add http.Server timeouts	Production resilience
+7	Graceful SIGTERM shutdown	Kubernetes/container friendly
+8	slog	Structured logging
+9	Validate PORT	Fail fast on configuration errors
+One particularly important point
+
+Given that you're already working with DevOps/MLOps and production infrastructure, I'd prioritize the observability changes over cosmetic Go refactoring.
+
+Your current metrics:
+
+http_requests_total{path, status}
+http_request_duration_seconds{path}
+
+are a good start, but I'd aim for:
+
+http_server_requests_total{
+    method,
+    route,
+    status
+}
+
+http_server_request_duration_seconds{
+    method,
+    route
+}
+
+with route based on the registered Go route rather than the raw URL.
+
+That gives you useful Prometheus/Grafana queries such as:
+
+rate(http_server_requests_total[5m])
+
+rate(http_server_requests_total{status=~"5.."}[5m])
+
+and:
+
+histogram_quantile(
+  0.95,
+  rate(http_server_request_duration_seconds_bucket[5m])
+)
+
+without accidentally creating thousands of Prometheus time series from IDs in /tasks/{id}.
+
+If you want, I can also
+take this exact code and produce a cleaned-up production version while preserving your existing handlers and MemoryStore architecture.
+
+Yes — 30 ms total request time with no visible histogram bar can be completely normal, depending on the Grafana/PromQL query.
+
+But there's an important distinction: if you're looking at a histogram graph with bucket boundaries, 30 ms should fall into the 0.05 (50 ms) bucket and therefore should be visible.
+
+Your buckets are:
+
+1 ms
+5 ms
+10 ms
+50 ms
+100 ms
+250 ms
+500 ms
+1 s
+2.5 s
+5 s
+
+So a 30 ms request should produce approximately:
+
+le="0.001"   → 0
+le="0.005"   → 0
+le="0.01"    → 0
+le="0.05"    → 1
+
+The first thing I'd check
+
+In Prometheus/Grafana, query the raw buckets:
+
+http_request_duration_seconds_bucket
+
+You should see something like:
+
+http_request_duration_seconds_bucket{method="GET",route="/tasks",le="0.001"} 0
+http_request_duration_seconds_bucket{method="GET",route="/tasks",le="0.005"} 0
+http_request_duration_seconds_bucket{method="GET",route="/tasks",le="0.01"} 0
+http_request_duration_seconds_bucket{method="GET",route="/tasks",le="0.05"} 1
+
+If you see that, your Go instrumentation is working.
+If you're using a graph of average duration
+
+If your query is something like:
+
+rate(http_request_duration_seconds_sum[5m])
+/
+rate(http_requests_total[5m])
+
+then the result should be around:
+
+0.03
+
+because Prometheus stores seconds.
+
+That's:
+
+0.03 seconds = 30 ms
+
+If Grafana is configured to display the axis as seconds, it might be difficult to see because the value is only 0.03.
+
+I'd configure the Grafana field/unit as:
+
+Time → seconds (s)
+
+or, even better for this API:
+
+Time → milliseconds (ms)
+
+Then the graph will show:
+
+30 ms
+
+instead of:
+
+0.03 s
+
+One more thing I want you to check
+
+Because we changed the metric labels, your request count is now:
+
+http_requests_total{method,route,status}
+
+while duration is:
+
+http_request_duration_seconds{method,route}
+
+So if your Grafana query still expects the old path label, it won't behave as before.
+
+If you paste the exact PromQL query used by your Grafana graph, I can tell you why the 30 ms isn't appearing.
+
+it was working with 
+        httpDuration.WithLabelValues(path).Observe(duration)
+<------>httpRequestsTotal.WithLabelValues(path, statusCodeStr).Inc()
+so fix it or return the old code
+
+Yes. Since the original metrics were working and you want to preserve the existing Grafana/Prometheus behavior, let's revert the metric label schema and only fix the response-writer correctness.
+
+The important part is to keep:
+
+    httpDuration with label path
+
+    httpRequestsTotal with labels path, status
+
+    normalizePath(r.URL.Path)
+
+    the original metric names
+
+    the original histogram buckets
+
+Use this version:
+
+// Histogram definition
+var httpDuration = promauto.NewHistogramVec(
+    prometheus.HistogramOpts{
+	Name:    "http_request_duration_seconds",
+	Help:    "HTTP requests in seconds",
+	Buckets: []float64{
+	    0.001,
+	    0.005,
+	    0.01,
+	    0.05,
+	    0.1,
+	    0.25,
+	    0.5,
+	    1,
+	    2.5,
+	    5,
+	},
+    },
+    []string{"path"},
+)
+
+var httpRequestsTotal = promauto.NewCounterVec(
+    prometheus.CounterOpts{
+	Name: "http_requests_total",
+	Help: "HTTP requests processed",
+    },
+    []string{"path", "status"},
+)
+
+type responseWriter struct {
+    http.ResponseWriter
+    statusCode  int
+    wroteHeader bool
+}
+
+func newResponseWriter(w http.ResponseWriter) *responseWriter {
+    return &responseWriter{
+	ResponseWriter: w,
+	statusCode:     http.StatusOK,
+    }
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+    // Only the first WriteHeader determines the response status.
+    if rw.wroteHeader {
+	return
+    }
+
+    rw.statusCode = code
+    rw.wroteHeader = true
+
+    rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *responseWriter) Write(b []byte) (int, error) {
+    // Writing the body implicitly sends HTTP 200.
+    if !rw.wroteHeader {
+	rw.WriteHeader(http.StatusOK)
+    }
+
+    return rw.ResponseWriter.Write(b)
+}
+
+// HTTP metrics middleware.
+func prometheusMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
+	rw := newResponseWriter(w)
+	next.ServeHTTP(rw, r)
+
+	duration := time.Since(start).Seconds()
+	statusCodeStr := strconv.Itoa(rw.statusCode)
+
+	// Normalize dynamic task paths so that:
+	// /tasks/1, /tasks/2, /tasks/3
+	// are all recorded as /tasks.
+	path := normalizePath(r.URL.Path)
+
+	// Preserve the original working metric labels.
+	httpDuration.WithLabelValues(path).Observe(duration)
+	httpRequestsTotal.WithLabelValues(path, statusCodeStr).Inc()
+    })
+}
+
+func normalizePath(path string) string {
+    if path == "/tasks" || strings.HasPrefix(path, "/tasks/") {
+	return "/tasks"
+    }
+
+    return path
+}
+
+Show more
+Why I am reverting the previous change
+
+The previous version changed the Prometheus label schema from:
+
+http_request_duration_seconds{path="..."}
+http_requests_total{path="...",status="..."}
+
+to:
+
+http_request_duration_seconds{method="...",route="..."}
+http_requests_total{method="...",route="...",status="..."}
+
+That was an unnecessary change for your situation. It can break existing Grafana queries and dashboards.
+
+Your original:
+
+httpDuration.WithLabelValues(path).Observe(duration)
+httpRequestsTotal.WithLabelValues(path, statusCodeStr).Inc()
+
+was not the problem.
+
+Also, your 0.001 bucket is not a lower limit. It means requests taking ≤1 ms go into that bucket. A 30 ms request should appear in the cumulative 0.05 bucket:
+
+le="0.001"   <= 1 ms
+le="0.005"   <= 5 ms
+le="0.01"    <= 10 ms
+le="0.05"    <= 50 ms   <-- 30 ms request appears here
+
+So I would not change anything else yet. Restore this middleware first and verify that the existing Grafana graph comes back.
+
+what's the final code?
+
+Yes — given that the original version was working, I would use this as the final conservative version. It keeps your original Prometheus metric schema and only fixes the responseWriter behavior.
+Final task API code
+
+package main
+
+import (
+    "flag"
+    "fmt"
+    "log"
+    "net/http"
+    "net/http/httptest"
+    "os"
+    "strconv"
+    "strings"
+    "time"
+
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// Histogram definition.
+var httpDuration = promauto.NewHistogramVec(
+    prometheus.HistogramOpts{
+	Name:    "http_request_duration_seconds",
+	Help:    "HTTP requests in seconds",
+	Buckets: []float64{
+	    0.001,
+	    0.005,
+	    0.01,
+	    0.05,
+	    0.1,
+	    0.25,
+	    0.5,
+	    1,
+	    2.5,
+	    5,
+	},
+    },
+    []string{"path"},
+)
+
+var httpRequestsTotal = promauto.NewCounterVec(
+    prometheus.CounterOpts{
+	Name: "http_requests_total",
+	Help: "HTTP requests processed",
+    },
+    []string{"path", "status"},
+)
+
+type responseWriter struct {
+    http.ResponseWriter
+    statusCode  int
+    wroteHeader bool
+}
+
+func newResponseWriter(w http.ResponseWriter) *responseWriter {
+    return &responseWriter{
+	ResponseWriter: w,
+	statusCode:     http.StatusOK,
+    }
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+    // Only the first WriteHeader call determines the response status.
+    if rw.wroteHeader {
+	return
+    }
+
+    rw.statusCode = code
+    rw.wroteHeader = true
+
+    rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *responseWriter) Write(b []byte) (int, error) {
+    // Writing a response body implicitly sends HTTP 200
+    // if no status has been written yet.
+    if !rw.wroteHeader {
+	rw.WriteHeader(http.StatusOK)
+    }
+
+    return rw.ResponseWriter.Write(b)
+}
+
+// Prometheus metrics middleware.
+func prometheusMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
+	rw := newResponseWriter(w)
+	next.ServeHTTP(rw, r)
+
+	duration := time.Since(start).Seconds()
+	statusCodeStr := strconv.Itoa(rw.statusCode)
+
+	// Normalize the path label to avoid creating a separate
+	// Prometheus time series for every task ID.
+	path := normalizePath(r.URL.Path)
+
+	httpDuration.WithLabelValues(path).Observe(duration)
+	httpRequestsTotal.WithLabelValues(path, statusCodeStr).Inc()
+    })
+}
+
+func normalizePath(path string) string {
+    if path == "/tasks" || strings.HasPrefix(path, "/tasks/") {
+	return "/tasks"
+    }
+
+    return path
+}
+
+func main() {
+    port := getEnv("PORT", "8080")
+
+    // Run internal health check and exit.
+    isHealthcheck := flag.Bool(
+	"healthcheck",
+	false,
+	"Run internal health check query",
+    )
+    flag.Parse()
+
+    if *isHealthcheck {
+	runHealthcheck(port)
+	return
+    }
+
+    store := NewMemoryStore()
+
+    mux := http.NewServeMux()
+
+    // Health check — must respond 200 for liveness probes.
+    mux.HandleFunc("GET /healthz", HealthHandler)
+
+    // Metrics — application metrics plus Prometheus metrics.
+    oldMetricsFunc := MetricsHandler(store)
+
+    mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+	oldMetricsFunc(w, r)
+
+	// Prevent promhttp from returning compressed output because
+	// its response is being appended to the existing metrics response.
+	r.Header.Del("Accept-Encoding")
+
+	rec := httptest.NewRecorder()
+	promhttp.Handler().ServeHTTP(rec, r)
+
+	_, _ = w.Write([]byte("\n"))
+	_, _ = w.Write(rec.Body.Bytes())
+    })
+
+    // Task CRUD.
+    mux.HandleFunc("GET /tasks", ListTasksHandler(store))
+    mux.HandleFunc("POST /tasks", CreateTaskHandler(store))
+    mux.HandleFunc("GET /tasks/{id}", GetTaskHandler(store))
+    mux.HandleFunc("PUT /tasks/{id}", UpdateTaskHandler(store))
+    mux.HandleFunc("DELETE /tasks/{id}", DeleteTaskHandler(store))
+
+    addr := ":" + port
+
+    log.Printf("task-api starting on %s", addr)
+
+    if err := http.ListenAndServe(
+	addr,
+	prometheusMiddleware(mux),
+    ); err != nil {
+	log.Fatalf("server error: %v", err)
+    }
+}
+
+func runHealthcheck(port string) {
+    client := &http.Client{
+	Timeout: 5 * time.Second,
+    }
+
+    url := fmt.Sprintf("http://localhost:%s/healthz", port)
+
+    resp, err := client.Get(url)
+    if err != nil {
+	fmt.Printf("Health check failed: %v\n", err)
+	os.Exit(1)
+    }
+
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+	fmt.Printf("Health check failed: HTTP %d\n", resp.StatusCode)
+	os.Exit(1)
+    }
+
+    fmt.Println("Health check OK")
+}
+
+func getEnv(key, fallback string) string {
+    if value := os.Getenv(key); value != "" {
+	return value
+    }
+
+    return fallback
+}
+
+Key point: the Prometheus portion is back to exactly your working label model:
+
+httpDuration.WithLabelValues(path).Observe(duration)
+httpRequestsTotal.WithLabelValues(path, statusCodeStr).Inc()
+
+So your existing Grafana queries should continue to work. The only middleware change is making responseWriter correctly preserve the first status code and handle implicit 200 OK.
+
+I would leave the metric schema alone from here.
+
+

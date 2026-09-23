@@ -1,0 +1,997 @@
+Yesterday 7:13 PM
+
+I have basic ci-cd pipeline, which I would like to modify:
+
+    split into several files for flexibility
+    run whole deployment on local, when pushed into feature branch
+    run build-and-publish if pushed into main or release/ branch
+    promote image artifact to release
+    deploy release/ or main separately on demand
+    Cloud deploy not used for now, but leave it as a future plug
+
+name: CI/CD Pipeline
+
+on:
+push:
+branches:
+- main
+workflow_dispatch: # trigger for any branch on-demand
+
+env:
+REGISTRY: ghcr.io
+IMAGE_NAME: ${{ github.repository }}
+CONTAINER_NAME: dv-app1
+ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
+jobs:
+--- CI Stage: Validate and Publish ---
+
+build-and-publish:
+runs-on: ubuntu-latest
+permissions:
+contents: read
+packages: write
+
+steps:
+  - name: Checkout code
+    uses: actions/checkout@v4
+
+  - name: Set up Go
+    uses: actions/setup-go@v5
+    with:
+      go-version: '1.26'
+      cache: true
+
+  - name: Validate (Test & Lint)
+    run: |
+      go vet ./...
+      go test -v ./...
+
+  - name: Log in to GitHub Container Registry
+    uses: docker/login-action@v4
+    with:
+      registry: ${{ env.REGISTRY }}
+      username: ${{ github.actor }}
+      password: ${{ secrets.GITHUB_TOKEN }}
+
+  - name: Extract metadata for Docker
+    id: meta
+    uses: docker/metadata-action@v5
+    with:
+      images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+      tags: |
+        type=ref,event=branch
+        type=sha,format=short
+
+  - name: Build and Push Docker Image
+    uses: docker/build-push-action@v6
+    with:
+      context: .
+      push: true
+      tags: ${{ steps.meta.outputs.tags }}
+      labels: ${{ steps.meta.outputs.labels }}
+
+--- CD Stage: Local Deployment ---
+
+deploy-local:
+needs: build-and-publish
+if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+runs-on: self-hosted # runs pipeline on local machine
+
+steps:
+  - name: Checkout code locally
+    uses: actions/checkout@v4
+
+  - name: Log in to GHCR locally
+    run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+  - name: Pull latest image
+    run: |
+      # Determine tag based on branch
+      if [ "${{ github.ref_name }}" = "main" ]; then
+        TAG="main"
+      else
+        TAG="${{ github.ref_name }}"
+      fi
+      docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG
+
+  - name: Deploy Stack locally
+    run: |
+      # Determine tag based on branch
+      if [ "${{ github.ref_name }}" = "main" ]; then
+        TAG="main"
+      else
+        TAG="${{ github.ref_name }}"
+      fi
+
+      # Export the image variable for docker-compose to ingest
+      export IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG"
+
+      # Pull the fresh application image
+      docker compose pull dv-app1
+
+      # Recreate and start changed containers, detach, and remove old orphan containers
+      docker compose up -d --remove-orphans
+
+  - name: Clean up old Docker images
+    run: docker image prune -f
+
+--- CD Stage: Cloud Deployment ---
+
+deploy-cloud:
+steps:
+- name: Deploy
+run: |
+echo Deploy OK
+
+Yes. I’d restructure this into reusable workflows, with a clear separation between:
+
+    CI/build — runs on main and release/*
+
+    artifact promotion — promotes an already-built image without rebuilding
+
+    local deployment — can deploy a selected image on demand
+
+    cloud deployment — reserved as a future workflow
+
+    feature branches — run the complete build/test/deploy cycle locally, but do not publish to GHCR
+
+One important design point: your current workflow uses GHCR as both the build artifact store and the deployment source. For feature branches, if you want deployment to happen entirely on the local machine, I would build the Docker image directly on the self-hosted runner rather than push a feature-branch image to GHCR.
+
+For main/release/*, build once, publish once, then promote that exact immutable image.
+Suggested structure
+
+.github/
+└── workflows/
+    ├── ci.yml
+    ├── build-and-publish.yml
+    ├── promote.yml
+    ├── deploy-local.yml
+    └── deploy-cloud.yml        # future
+
+I would make ci.yml the orchestration workflow and keep the actual operations in reusable workflows.
+1. Feature branches
+
+When someone pushes:
+
+feature/foo
+bugfix/bar
+
+run:
+
+test
+  ↓
+docker build
+  ↓
+local docker compose deploy
+
+Nothing gets published to GHCR.
+2. main / release/*
+
+When pushed:
+
+main
+release/1.2.0
+
+run:
+
+test
+  ↓
+docker build
+  ↓
+push GHCR
+
+The image should have immutable tags, e.g.:
+
+sha-abc1234
+
+and optionally:
+
+main
+release-1.2.0
+
+The important artifact is the SHA tag.
+3. Promote
+
+Promotion should not rebuild the image.
+
+For example:
+
+ghcr.io/myorg/dv-app1:sha-abc1234
+                 ↓
+ghcr.io/myorg/dv-app1:release-1.2.0
+
+That guarantees that what you release is exactly what you built/tested.
+4. Deploy on demand
+
+I'd make deployment a separate workflow_dispatch workflow with inputs such as:
+
+environment: local
+image_tag: sha-abc1234
+
+or:
+
+image_tag: release-1.2.0
+
+That lets you deploy main or a release independently from the build.
+One change I'd make to your current design
+
+I would not use:
+
+TAG="${{ github.ref_name }}"
+
+as the primary artifact identity.
+
+Branch names are mutable. Instead, use the Git commit SHA as the immutable image identity:
+
+ghcr.io/org/app:sha-abc1234
+
+Then use human-friendly tags as aliases:
+
+main
+release-1.2.0
+
+For example:
+
+                     ┌── main
+                     │
+commit abc1234 ──────┼── sha-abc1234
+                     │
+                     └── release-1.2.0
+
+All three can point to the same image digest.
+Proposed implementation
+.github/workflows/ci.yml
+
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/**'
+      - '**'
+
+  workflow_dispatch:
+    inputs:
+      deploy_local:
+        description: 'Deploy to local environment'
+        type: boolean
+        default: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  CONTAINER_NAME: dv-app1
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
+jobs:
+
+  # ============================================================
+  # Feature branches
+  # ============================================================
+
+  feature:
+    if: >
+      github.event_name == 'push' &&
+      github.ref_type == 'branch' &&
+      github.ref_name != 'main' &&
+      !startsWith(github.ref_name, 'release/')
+
+    uses: ./.github/workflows/build-deploy-local.yml
+
+    secrets: inherit
+
+  # ============================================================
+  # Main / release branches
+  # ============================================================
+
+  build:
+    if: >
+      github.event_name == 'push' &&
+      (
+        github.ref_name == 'main' ||
+        startsWith(github.ref_name, 'release/')
+      )
+
+    uses: ./.github/workflows/build-and-publish.yml
+
+    secrets: inherit
+
+  # ============================================================
+  # Manual deployment
+  # ============================================================
+
+  deploy:
+    if: github.event_name == 'workflow_dispatch' &&
+        inputs.deploy_local == true
+
+    uses: ./.github/workflows/deploy-local.yml
+
+    with:
+      image_tag: ${{ github.sha }}
+
+    secrets: inherit
+
+However, there's a subtle issue here: if workflow_dispatch is run on a branch that hasn't previously published an image, $GITHUB_SHA isn't necessarily a published artifact. So I'd actually make the manual workflow its own workflow, rather than putting it into this orchestration workflow.
+
+That gives you a cleaner architecture.
+build-and-publish.yml
+
+name: Build and Publish
+
+on:
+  workflow_call:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Validate
+        run: |
+          go vet ./...
+          go test -v ./...
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=branch
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+This produces, for example:
+
+ghcr.io/myorg/dv-app1:sha-a1b2c3d
+ghcr.io/myorg/dv-app1:main
+
+or for a release branch:
+
+ghcr.io/myorg/dv-app1:sha-a1b2c3d
+ghcr.io/myorg/dv-app1:release-1.2.0
+
+build-deploy-local.yml
+
+For feature branches, I would avoid GHCR entirely.
+
+name: Build and Deploy Local
+
+on:
+  workflow_call:
+
+env:
+  IMAGE_NAME: dv-app1
+
+jobs:
+  build-deploy:
+    runs-on: self-hosted
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Validate
+        run: |
+          go vet ./...
+          go test -v ./...
+
+      - name: Build local image
+        run: |
+          docker build \
+            -t "${IMAGE_NAME}:${GITHUB_SHA}" \
+            .
+
+      - name: Deploy local
+        run: |
+          export IMAGE_TAG="${IMAGE_NAME}:${GITHUB_SHA}"
+
+          docker compose up -d --remove-orphans
+
+      - name: Cleanup
+        run: |
+          docker image prune -f
+
+Your docker-compose.yml would then use:
+
+services:
+  dv-app1:
+    image: ${IMAGE_TAG}
+
+This gives feature branches a very nice behavior:
+
+git push feature/foo
+        │
+        ▼
+GitHub Actions
+        │
+        ▼
+self-hosted runner
+        │
+        ├── go vet
+        ├── go test
+        ├── docker build
+        └── docker compose up
+
+No registry interaction is required.
+Promotion workflow
+
+This is where I'd make the architecture more robust.
+
+.github/workflows/promote.yml
+
+name: Promote Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: 'Existing image tag'
+        required: true
+        type: string
+
+      release_tag:
+        description: 'New release tag'
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: write
+
+    steps:
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull source image
+        run: |
+          docker pull \
+            "${REGISTRY}/${IMAGE_NAME}:${{ inputs.source_tag }}"
+
+      - name: Tag release image
+        run: |
+          docker tag \
+            "${REGISTRY}/${IMAGE_NAME}:${{ inputs.source_tag }}" \
+            "${REGISTRY}/${IMAGE_NAME}:${{ inputs.release_tag }}"
+
+      - name: Push release image
+        run: |
+          docker push \
+            "${REGISTRY}/${IMAGE_NAME}:${{ inputs.release_tag }}"
+
+So you could do:
+
+source_tag = sha-a1b2c3d
+release_tag = release-1.2.0
+
+and get:
+
+sha-a1b2c3d
+      │
+      ▼
+release-1.2.0
+
+without rebuilding.
+Local deployment workflow
+
+.github/workflows/deploy-local.yml
+
+name: Deploy Local
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy'
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" |
+            docker login "${REGISTRY}" \
+              -u "${{ github.actor }}" \
+              --password-stdin
+
+      - name: Pull image
+        run: |
+          docker pull \
+            "${REGISTRY}/${IMAGE_NAME}:${{ inputs.image_tag }}"
+
+      - name: Deploy
+        run: |
+          export IMAGE_TAG="${REGISTRY}/${IMAGE_NAME}:${{ inputs.image_tag }}"
+
+          docker compose pull dv-app1
+          docker compose up -d --remove-orphans
+
+      - name: Cleanup
+        run: |
+          docker image prune -f
+
+Now you can go to Actions → Deploy Local → Run workflow and enter:
+
+release-1.2.0
+
+or:
+
+sha-a1b2c3d
+
+and deploy that exact artifact.
+Future cloud deployment
+
+I'd leave this as a completely separate workflow:
+
+.github/workflows/deploy-cloud.yml
+
+name: Deploy Cloud
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy'
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy
+        run: |
+          echo "Future cloud deployment"
+          echo "Image: ${REGISTRY}/${IMAGE_NAME}:${{ inputs.image_tag }}"
+
+Later you can replace that step with AWS/Azure/GCP/etc. deployment without changing the build/promotion process.
+Resulting lifecycle
+
+The overall flow becomes:
+
+                         FEATURE BRANCH
+                              │
+                         git push
+                              │
+                              ▼
+                    ┌──────────────────┐
+                    │   Local runner   │
+                    │                  │
+                    │ go vet           │
+                    │ go test          │
+                    │ docker build     │
+                    │ docker compose   │
+                    └──────────────────┘
+
+
+                           MAIN
+                            │
+                       git push
+                            │
+                            ▼
+                   ┌──────────────────┐
+                   │ GitHub runner    │
+                   │                  │
+                   │ test             │
+                   │ build            │
+                   │ push GHCR        │
+                   └────────┬─────────┘
+                            │
+                            ▼
+                       sha-a1b2c3d
+                            │
+                            │
+                    ┌───────┴────────┐
+                    │                │
+                    ▼                ▼
+               deploy local     promote release
+                                      │
+                                      ▼
+                                release-1.2.0
+                                      │
+                                      ▼
+                               deploy on demand
+
+This also solves an important operational problem in the original workflow: build and deployment become independent. You don't need to rebuild an application just because you want to deploy it again, and you can deploy a specific immutable artifact rather than whatever happens to be behind main at the moment.
+
+One thing I'd change further before you implement this is the release-tagging convention. There are two reasonable models—release/1.2.0 as a Git branch with release-1.2.0 as the image, or Git tags such as v1.2.0 driving promotion—and the choice affects the exact GitHub Actions triggers.
+
+That error means your reusable deploy-local.yml still declares GHCR_TOKEN as a required secret.
+
+The important part is:
+
+Secret GHCR_TOKEN is required, but not provided while calling
+
+So deploy-local-manual.yml is calling deploy-local.yml, but the called workflow has something like:
+
+on:
+  workflow_call:
+    secrets:
+      GHCR_TOKEN:
+        required: true
+
+Recommended fix
+
+You don't need a custom GHCR_TOKEN here. Use GitHub's built-in GITHUB_TOKEN instead.
+1. Change deploy-local.yml
+
+Remove the secrets section entirely from workflow_call.
+
+It should start like this:
+
+name: Deploy Local
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: Image tag to deploy
+        required: true
+        type: string
+
+Then give the job permission to read packages:
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine image tag
+        id: image
+        shell: bash
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          TAG="${TAG//\//-}"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          echo "======================================"
+          echo "Input tag: ${TAG}"
+          echo "Image:     ${REGISTRY}/${IMAGE_NAME}:${TAG}"
+          echo "======================================"
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ github.token }}" |
+            docker login "${REGISTRY}" \
+              -u "${{ github.actor }}" \
+              --password-stdin
+
+      - name: Pull image
+        run: |
+          IMAGE_REF="${REGISTRY}/${IMAGE_NAME}:${{ steps.image.outputs.tag }}"
+
+          echo "Pulling: ${IMAGE_REF}"
+
+          docker pull "${IMAGE_REF}"
+
+      - name: Deploy
+        run: |
+          export IMAGE_REF="${REGISTRY}/${IMAGE_NAME}:${{ steps.image.outputs.tag }}"
+
+          echo "Deploying: ${IMAGE_REF}"
+
+          docker compose pull dv-app1
+          docker compose up -d --remove-orphans
+
+      - name: Cleanup
+        run: docker image prune -f
+
+with:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+at the workflow level.
+2. deploy-local-manual.yml
+
+Then your manual workflow does not need to provide GHCR_TOKEN:
+
+name: Deploy Local Manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Image tag to deploy
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/deploy-local.yml
+
+    with:
+      image_tag: ${{ inputs.image_tag }}
+
+    permissions:
+      contents: read
+      packages: read
+
+    secrets: inherit
+
+secrets: inherit can remain, but it is no longer necessary for GHCR authentication.
+Why this works
+
+The authentication chain is:
+
+deploy-local-manual.yml
+          │
+          │ packages: read
+          ▼
+deploy-local.yml
+          │
+          │ github.token
+          ▼
+      GHCR login
+          │
+          ▼
+docker pull
+ghcr.io/owner/repository:release-1.2.0
+
+You do not need to create or maintain GHCR_TOKEN just to pull a private GHCR package from the same repository.
+
+Also make sure the promote workflow has:
+
+permissions:
+  packages: write
+
+because promotion needs to write the new release tag, while deployment only needs:
+
+packages: read
+
+So the permissions are intentionally different:
+
+build-and-publish   → packages: write
+promote             → packages: write
+deploy-local        → packages: read
+
+
+I do not have GHCR_TOKEN, only GITHUB_TOKEN
+
+Correct — and that's exactly why you're getting this error. You should not need GHCR_TOKEN at all. Your workflows should use GitHub's built-in GITHUB_TOKEN.
+
+The problem is in your deploy-local.yml: it is still declaring GHCR_TOKEN as a required secret.
+1. Fix deploy-local.yml
+
+Make the workflow_call section look exactly like this:
+
+name: Deploy Local
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: Image tag to deploy
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine image tag
+        id: image
+        shell: bash
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          TAG="${TAG//\//-}"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          echo "======================================"
+          echo "Input tag: ${TAG}"
+          echo "Image:     ${REGISTRY}/${IMAGE_NAME}:${TAG}"
+          echo "======================================"
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ github.token }}" |
+            docker login "${REGISTRY}" \
+              -u "${{ github.actor }}" \
+              --password-stdin
+
+      - name: Pull image
+        run: |
+          IMAGE_REF="${REGISTRY}/${IMAGE_NAME}:${{ steps.image.outputs.tag }}"
+
+          echo "Pulling: ${IMAGE_REF}"
+
+          docker pull "${IMAGE_REF}"
+
+      - name: Deploy
+        run: |
+          export IMAGE_REF="${REGISTRY}/${IMAGE_NAME}:${{ steps.image.outputs.tag }}"
+
+          echo "Deploying: ${IMAGE_REF}"
+
+          docker compose pull dv-app1
+          docker compose up -d --remove-orphans
+
+      - name: Cleanup
+        run: docker image prune -f
+
+The critical change is that there is no:
+
+secrets:
+  GHCR_TOKEN:
+    required: true
+
+anywhere in this reusable workflow.
+2. Your deploy-local-manual.yml
+
+Use:
+
+name: Deploy Local Manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Image tag to deploy
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/deploy-local.yml
+
+    with:
+      image_tag: ${{ inputs.image_tag }}
+
+    permissions:
+      contents: read
+      packages: read
+
+    secrets: inherit
+
+You can actually remove secrets: inherit here too, because you're not passing a custom secret:
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/deploy-local.yml
+
+    with:
+      image_tag: ${{ inputs.image_tag }}
+
+    permissions:
+      contents: read
+      packages: read
+
+3. Why GITHUB_TOKEN works
+
+GitHub automatically provides:
+
+GITHUB_TOKEN
+
+to the workflow.
+
+You don't create it manually.
+
+This:
+
+${{ github.token }}
+
+is the same built-in token and is what we're using for:
+
+docker login ghcr.io
+
+The caller grants it:
+
+permissions:
+  packages: read
+
+so the deployment workflow can pull the private GHCR image.
+
+Your three workflows should therefore have:
+
+build-and-publish.yml
+    packages: write
+          │
+          ▼
+       GHCR
+
+promote.yml
+    packages: write
+          │
+          ▼
+       GHCR
+
+deploy-local.yml
+    packages: read
+          │
+          ▼
+       GHCR
+
+So don't create a GHCR_TOKEN. Remove that requirement from deploy-local.yml. The error you're seeing is coming from the workflow definition, not from your GitHub account lacking a secret.
+

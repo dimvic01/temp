@@ -1,0 +1,34 @@
+# Git
+.git/
+.gitignore
+
+# Binaries
+bin/
+
+# Test artifacts
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+
+# Markdown / docs (not needed at runtime)
+*.md
+
+# CI / deploy config (not needed at runtime)
+.github/
+deploy/
+monitoring/
+docker-compose.yml
+Makefile

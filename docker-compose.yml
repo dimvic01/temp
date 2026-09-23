@@ -1,0 +1,84 @@
+networks:
+  monitoring:
+    driver: bridge
+
+services:
+  task-api:
+    build: .
+    environment:
+      PORT: "8080"
+    image: ${IMAGE_REF}
+    container_name: task-api
+    ports:
+      - "8088:8080"
+    networks:
+      - monitoring
+    restart: always
+
+  prometheus:
+    image: prom/prometheus:v2.54.0
+    container_name: prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - monitoring
+    restart: always
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - monitoring
+    restart: always
+    environment:
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+        - ./monitoring/dashboards:/var/lib/grafana/dashboards
+        - ./monitoring/provisioning:/etc/grafana/provisioning
+
+  load-tester:
+    image: alpine
+    container_name: load-tester
+    networks:
+      - monitoring
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache curl jq
+        while true; do
+            echo Running api test
+            export ID=$$(curl -s -X POST -H "Content-Type: application/json" task-api:8080/tasks -d '{"title": "task"}'|jq .id)
+            echo created task $$ID
+            sleep 1m
+            curl -s -X PUT -H "Content-Type: application/json" task-api:8080/tasks/$$ID -d '{"done": true, "title": "task"}'
+            sleep 1m
+            curl -s -X DELETE -H "Content-Type: application/json" task-api:8080/tasks/$$ID
+            sleep 1m
+        done
+
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - monitoring
+    restart: always
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    container_name: promtail
+    volumes:
+      # Reads container logs directly from Docker engine
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./monitoring/promtail/config.yml:/etc/promtail/config.yml
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - monitoring
+    restart: always

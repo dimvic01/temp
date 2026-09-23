@@ -1,0 +1,52 @@
+name: Build and Deploy Local
+
+on:
+  workflow_call:
+
+env:
+  IMAGE_NAME: task-api
+
+jobs:
+  build-deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: image
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME//\//-}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Local image: ${IMAGE_NAME}:${TAG}"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Validate
+        run: |
+          go vet ./...
+          go test -v ./...
+
+      - name: Build local image
+        run: |
+          docker build \
+            -t "${IMAGE_NAME}:${{ steps.image.outputs.tag }}" \
+            .
+
+      - name: Deploy
+        run: |
+          export IMAGE_REF="${IMAGE_NAME}:${{ steps.image.outputs.tag }}"
+
+          echo "Deploying ${IMAGE_REF}"
+
+          docker compose up -d --remove-orphans
+
+      - name: Cleanup
+        run: |
+          docker image prune -f
